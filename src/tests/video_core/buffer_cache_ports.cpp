@@ -64,6 +64,9 @@ struct Runtime {
     u32 GetStorageBufferAlignment() const {
         return alignment;
     }
+    u64 GetMaxStorageBufferRange() const {
+        return max_storage_buffer_range;
+    }
     u32 GetUniformBufferAlignment() const {
         return 1;
     }
@@ -133,6 +136,7 @@ struct Runtime {
     }
 
     u32 alignment{256};
+    u64 max_storage_buffer_range{1ULL << 30};
     u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{};
     u32 host_read_barriers{};
     u64 upload_bytes{}, waited_tick{};
@@ -344,13 +348,40 @@ TEST_CASE("Storage binding cache preserves native and table size policies", "[bu
     f.Descriptor(base, 256);
     REQUIRE(f.Bind().size == 4096);
     REQUIRE(f.Bind(false, true).size == 8 << 20);
-    REQUIRE(f.Bind(false, false, true).size == 64 << 20);
+    REQUIRE(f.Bind(false, false, true).size == 80 << 20);
     REQUIRE(f.Bind(true, false, true).size == 256);
     f.Descriptor(base, (1ULL << 32) | 256);
     REQUIRE(f.Bind().size == 8 << 20);
-    REQUIRE(f.Bind(false, false, true).size == 64 << 20);
+    REQUIRE(f.Bind(false, false, true).size == 80 << 20);
     f.Descriptor(base + (79 << 20), 0);
     REQUIRE(f.Bind(false, false, true).size == 1 << 20);
+}
+
+TEST_CASE("Read-only table pools reach distant probes within device and mapping limits",
+          "[buffer_ports][table_pool_range]") {
+    const u64 device_limit = GENERATE(128ULL << 20, 1ULL << 30);
+    const u32 alignment = GENERATE(4U, 256U, 65536U);
+    Fixture f;
+    f.runtime.max_storage_buffer_range = device_limit;
+    f.runtime.alignment = alignment;
+    constexpr GPUVAddr base = 0x4000000;
+    constexpr u32 mapped_size = 384U << 20;
+    f.memory->Map(base, 0x10000000, mapped_size, Tegra::PTEKind::PITCH, true);
+    f.Descriptor(base + 0x123, 256);
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        const auto binding = f.Bind(false, true, true);
+        CHECK(binding.size > (122U << 20));
+        CHECK(binding.size <= device_limit);
+        CHECK(binding.gpu_addr + binding.size <= base + mapped_size);
+        CHECK(binding.gpu_addr <= base + 0x123);
+        // Writable pools and direct native pointers keep their smaller ranges.
+        CHECK(f.Bind(true, true, true).size <= (8U << 20) + alignment);
+        CHECK(f.Bind(false, true, false).size <= (8U << 20) + 65536U);
+    }
+    // A remap that breaks the contiguous device range must invalidate the larger cached binding.
+    f.memory->Map(base + (96U << 20), 0x60000000, 65536, Tegra::PTEKind::PITCH, true);
+    const auto split = f.Bind(false, true, true);
+    CHECK(split.gpu_addr + split.size == base + (96U << 20));
 }
 
 TEST_CASE("Storage binding cache does not reuse a destroyed address space", "[buffer_ports]") {
